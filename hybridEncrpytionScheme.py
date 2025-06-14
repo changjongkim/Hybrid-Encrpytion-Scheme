@@ -6,6 +6,8 @@ import time
 import queue
 import threading
 import subprocess
+import mmap
+
 from Crypto.Cipher import AES
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from secretsharing import PlaintextToHexSecretSharer as Shamir
@@ -41,7 +43,9 @@ def bb84_worker(seed):
 def run_bb84_parallel(required_key_bits=128, workers=8):
     alice_key = []
     bob_key = []
+    loop_count = 0
     while len(alice_key) < required_key_bits:
+        loop_count += 1
         seeds = np.random.randint(0, 100000, size=required_key_bits)
         with ProcessPoolExecutor(max_workers=workers) as executor:
             for a_bit, a_base, b_base, measurement in executor.map(bb84_worker, seeds):
@@ -55,7 +59,8 @@ def run_bb84_parallel(required_key_bits=128, workers=8):
         if qber > 0.11:
             alice_key.clear()
             bob_key.clear()
-    return alice_key[:required_key_bits]
+    return alice_key[:required_key_bits], loop_count
+
 
 def aes_encrypt_chunk(data, key):
     cipher = AES.new(key, AES.MODE_CTR)
@@ -93,7 +98,7 @@ if __name__ == "__main__":
     num_slaves = size - 1
     chunk_size = 8 * 1024 * 1024
     batch_size = 100
-    filepath = "ECU-IoHT-Dataset_100GB.csv"
+    filepath = "ECU-IoHT-Dataset_50GB.csv"
 
     if rank == 0:
         print("[KCJ:Master] * Phase: File Open")
@@ -117,9 +122,11 @@ if __name__ == "__main__":
 
         print("[KCJ:Master] * Phase: BB84 QKD Protocol")
         bb84_start = time.time()
-        qkd_bits = run_bb84_parallel(128, workers=8)
+        qkd_bits, loop_count = run_bb84_parallel(128, workers=8)
         bb84_end = time.time()
         print(f"[KCJ:Timing] BB84 QKD protocol took {bb84_end - bb84_start:.3f} sec")
+        print(f"[KCJ:Master] * QKD loop count until success: {loop_count}")
+
 
         qkd_key_bytes = bytes([int("".join(map(str, qkd_bits[i:i+8])), 2) for i in range(0, 128, 8)])
         xor_private_key = xor_encrypt(private_key, qkd_key_bytes)
@@ -233,9 +240,35 @@ if __name__ == "__main__":
 
         print("[KCJ:Master] * Phase: AES Decryption Start")
         decrypt_start = time.time()
+        
+        # Step 1: chunk index 기준 정렬 (순서 보장용)
+        chunk_items = sorted(received_chunks.items())
+        
+        # Step 2: output 파일 스트리밍 write
+        with open("recovered_output.csv", "wb") as f:
+            def decrypt_and_write(pair):
+                idx, encrypted_chunk = pair
+                nonce = encrypted_chunk[:8]
+                ciphertext = encrypted_chunk[8:]
+                decrypted = AES.new(recovered_aes_key, AES.MODE_CTR, nonce=nonce).decrypt(ciphertext)
+                return idx, decrypted
+        
+            with ThreadPoolExecutor(max_workers=32) as executor:
+                for idx, decrypted_chunk in executor.map(decrypt_and_write, chunk_items):
+                    # write는 반드시 순서대로
+                    f.write(decrypted_chunk)
+        
+        decrypt_end = time.time()
+        print(f"[KCJ:Master] * AES decryption (streamed write) time: {decrypt_end - decrypt_start:.3f} sec")
+
+
+
+
+'''
+        decrypt_start = time.time()
         chunk_items = sorted(received_chunks.items())
 
-        with ThreadPoolExecutor(max_workers=32) as executor:
+        with ThreadPoolExecutor(max_workers=16) as executor:
             decrypted_chunks = list(executor.map(lambda pair: aes_decrypt_chunk(pair, recovered_aes_key), chunk_items))
 
         decrypted_data = bytearray()
@@ -247,9 +280,9 @@ if __name__ == "__main__":
         
         with open("recovered_output.csv", "wb") as f:
             f.write(decrypted_data)
-
-        total_end = time.time()
-        print(f"[Time] * Total end-to-end time: {total_end - overall_start:.3f} sec")
+'''
+        #total_end = time.time()
+        #print(f"[Time] * Total end-to-end time: {total_end - overall_start:.3f} sec")
     
-    mpstat_proc.terminate()
+    #mpstat_proc.terminate()
 
